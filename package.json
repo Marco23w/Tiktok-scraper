@@ -1,9 +1,9 @@
 {
+  "type": "module",
   "dependencies": {
     "express": "^4.19.2",
     "playwright": "^1.46.0",
     "playwright-extra": "^4.3.6",
-    "playwright-extra-plugin-stealth": "^2.11.2"
-  },
-  "type": "module"
+    "puppeteer-extra-plugin-stealth": "2.11.2"
+  }
 }
