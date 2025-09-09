@@ -1,6 +1,9 @@
 // server.js
 import express from "express";
-import { chromium } from "playwright";
+import { chromium as pwChromium } from "playwright-extra";
+import stealth from "playwright-extra-plugin-stealth";
+pwChromium.use(stealth());
+
 
 const app = express();
 
