@@ -72,18 +72,20 @@ async function extractFromVideoPage(context, url) {
 }
 
 async function getTrendingTop50() {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
-  });
+  const proxyServer = process.env.PROXY_URL || ""; // es. http://user:pass@host:port
+const browser = await pwChromium.launch({
+  headless: true,
+  args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+  proxy: proxyServer ? { server: proxyServer } : undefined
+});
 
-  const context = await browser.newContext({
-    viewport: { width: 1366, height: 768 },
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-    locale: "it-IT",
-    extraHTTPHeaders: { "Accept-Language": "it-IT,it;q=0.9" },
-  });
+const context = await browser.newContext({
+  viewport: { width: 1366, height: 768 },
+  userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+  locale: "it-IT",
+  timezoneId: "Europe/Rome",
+  extraHTTPHeaders: { "Accept-Language": "it-IT,it;q=0.9" }
+});
 
   // piccola “stealth”
   await context.addInitScript(() => {
