@@ -1,8 +1,9 @@
 // server.js
 import express from "express";
 import { chromium as pwChromium } from "playwright-extra";
-import stealth from "playwright-extra-plugin-stealth";
+import stealth from "puppeteer-extra-plugin-stealth";
 pwChromium.use(stealth());
+
 
 
 const app = express();
