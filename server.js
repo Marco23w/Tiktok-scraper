@@ -1,9 +1,10 @@
 // server.js
 import express from "express";
-import playwright from "playwright-extra";
+import { chromium as chromiumExtra } from "playwright-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 
-playwright.use(StealthPlugin());
+// attiva lo stealth sul chromium di playwright-extra
+chromiumExtra.use(StealthPlugin());
 
 const app = express();
 
@@ -24,15 +25,10 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 
 // ---------- helpers browser
 async function newContext() {
-  const browser = await playwright.chromium.launch({
-    headless: HEADLESS,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-blink-features=AutomationControlled",
-      "--disable-dev-shm-usage",
-    ],
-  });
+  const browser = await chromiumExtra.launch({
+  headless: true,
+  args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+});
   const context = await browser.newContext({
     viewport: VIEWPORT,
     userAgent:
