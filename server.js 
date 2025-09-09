@@ -1,0 +1,78 @@
+import express from "express";
+import { chromium } from "playwright";
+
+const app = express();
+app.use(express.json());
+
+function pickHashTags(text=""){
+  // prendi fino a 8 hashtag dal testo
+  const m = text.match(/#\w+/g) || [];
+  return [...new Set(m)].slice(0,8);
+}
+
+function mapFromSIGI(state){
+  // Prova a leggere i video da ItemModule oppure da liste
+  const items = state?.ItemModule ? Object.values(state.ItemModule) : [];
+  return items.map(v => ({
+    video_id: v.id,
+    video_url: `https://www.tiktok.com/@${v.author}/video/${v.id}`,
+    author_username: v.author,
+    caption: v.desc || "",
+    hashtags: pickHashTags(v.desc || ""),
+    sound_title: state?.MusicModule?.music?.title || v.music?.title || "",
+    sound_artist: state?.MusicModule?.music?.authorName || v.music?.authorName || v.music?.author || "",
+    views: v.stats?.playCount ?? 0,
+    likes: v.stats?.diggCount ?? 0,
+    comments: v.stats?.commentCount ?? 0,
+    shares: v.stats?.shareCount ?? 0,
+    duration_sec: v.video?.duration ?? null,
+    published_at: v.createTime ? new Date(v.createTime * 1000).toISOString() : null,
+    thumbnail_url: v.video?.cover || null
+  }));
+}
+
+async function getTrendingTop50(){
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({
+    viewport: { width: 1366, height: 768 },
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+    locale: "it-IT"
+  });
+  const page = await context.newPage();
+
+  // Explore/Trending pubblico (varia spesso, questo è un MVP)
+  await page.goto("https://www.tiktok.com/explore", { waitUntil: "domcontentloaded" });
+
+  // scroll leggero per caricare abbastanza card
+  for (let i=0;i<6;i++){ await page.keyboard.press("PageDown"); await page.waitForTimeout(800+Math.random()*500); }
+
+  const state = await page.evaluate(() => {
+    const n = document.querySelector('#SIGI_STATE');
+    if(!n) return null;
+    try { return JSON.parse(n.textContent); } catch { return null; }
+  });
+
+  await browser.close();
+
+  let rows = mapFromSIGI(state);
+  // ordina per engagement semplice e prendi 50
+  rows.sort((a,b)=> (b.likes+b.comments+b.shares) - (a.likes+a.comments+a.shares));
+  return rows.slice(0,50);
+}
+
+app.get("/health", (_,res)=>res.json({ok:true}));
+
+// endpoint semplice che ritorna subito i 50
+app.get("/top50", async (_,res)=>{
+  try {
+    const data = await getTrendingTop50();
+    res.json(data);
+  } catch (e){
+    console.error(e);
+    res.status(500).json({error:"failed"});
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, ()=>console.log("scraper on :"+PORT));
+
