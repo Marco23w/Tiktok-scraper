@@ -1,13 +1,15 @@
 {
   "name": "tiktok-scraper",
   "version": "1.0.0",
-  "description": "TikTok trending videos scraper",
+  "description": "TikTok trending videos scraper for Render deployment",
   "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node test.js"
+    "build": "echo 'No build step required'",
+    "test": "node --test",
+    "postinstall": "npx playwright install chromium --with-deps"
   },
   "dependencies": {
     "express": "^4.19.2",
@@ -19,9 +21,14 @@
     "compression": "^1.7.4"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18.0.0",
+    "npm": ">=8.0.0"
   },
-  "keywords": ["tiktok", "scraper", "trending", "playwright"],
-  "author": "Your Name",
-  "license": "MIT"
+  "keywords": ["tiktok", "scraper", "trending", "playwright", "render"],
+  "author": "Mark",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/tiktok-scraper.git"
+  }
 }
