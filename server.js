@@ -1,4 +1,4 @@
-// server.js - Versione completa e testata
+// server.js - Versione completa con mobile strategy
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -23,10 +23,13 @@ const CONFIG = {
   PORT: process.env.PORT || 3000,
   LOG_LEVEL: process.env.LOG_LEVEL || "info",
   CACHE_TTL_MS: parseInt(process.env.CACHE_TTL_MINUTES ?? "15", 10) * 60 * 1000,
-  BASE_EXPLORE: "https://www.tiktok.com/foryou?lang=en",
-  VIEWPORT: { width: 1920, height: 1080 },
+  BASE_EXPLORE: "https://www.tiktok.com/@tiktok", // Profilo ufficiale
+  VIEWPORT: { width: 414, height: 896 }, // Mobile viewport
   MAX_RETRIES: 3,
-  REQUEST_TIMEOUT: 45000
+  REQUEST_TIMEOUT: 60000, // Timeout più lungo
+  
+  // Mobile User Agent (meno rilevato)
+  USER_AGENT: "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1"
 };
 
 // Simple logger
@@ -72,7 +75,17 @@ class SimpleCache {
 
 const cache = new SimpleCache();
 
-// Browser utilities
+// TikTok URLs to try
+const TIKTOK_URLS = [
+  "https://www.tiktok.com/@tiktok", // Profilo ufficiale TikTok
+  "https://www.tiktok.com/@charlidamelio", // Creator popolare
+  "https://www.tiktok.com/@khaby.lame", // Creator globale
+  "https://www.tiktok.com/@mrbeast", // Creator con molti video
+  "https://www.tiktok.com/foryou?lang=en",
+  "https://www.tiktok.com/explore?lang=en"
+];
+
+// Browser context ottimizzato per mobile
 async function createBrowserContext(retries = 0) {
   try {
     const browser = await chromiumExtra.launch({
@@ -83,9 +96,10 @@ async function createBrowserContext(retries = 0) {
         "--disable-dev-shm-usage",
         "--disable-web-security",
         "--disable-features=VizDisplayCompositor",
-        "--disable-background-timer-throttling",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-renderer-backgrounding",
+        "--user-agent=" + CONFIG.USER_AGENT,
+        // Mobile-specific args
+        "--enable-touch-events",
+        "--force-device-scale-factor=2",
         "--disable-blink-features=AutomationControlled",
         "--no-first-run"
       ],
@@ -93,28 +107,50 @@ async function createBrowserContext(retries = 0) {
 
     const context = await browser.newContext({
       viewport: CONFIG.VIEWPORT,
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+      userAgent: CONFIG.USER_AGENT,
       locale: "en-US",
       timezoneId: "America/New_York",
       geolocation: { latitude: 40.7128, longitude: -74.0060 },
       permissions: ["geolocation"],
-      hasTouch: false,
-      deviceScaleFactor: 1,
+      hasTouch: true, // Mobile touch
+      isMobile: true, // Mobile flag
+      deviceScaleFactor: 2,
       extraHTTPHeaders: {
         'Accept-Language': 'en-US,en;q=0.9',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Upgrade-Insecure-Requests': '1'
       }
     });
 
+    // Anti-detection scripts
     await context.addInitScript(() => {
+      // Remove webdriver traces
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      
+      // Mock mobile features
+      Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 5 });
+      Object.defineProperty(navigator, 'ontouchstart', { get: () => true });
+      
+      // Override permissions
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+          Promise.resolve({ state: Notification.permission }) :
+          originalQuery(parameters)
+      );
     });
 
     return { browser, context };
   } catch (error) {
     logger.error("Failed to create browser context:", error.message);
     if (retries < CONFIG.MAX_RETRIES) {
-      await new Promise(resolve => setTimeout(resolve, 2000 * (retries + 1)));
+      await new Promise(resolve => setTimeout(resolve, 3000 * (retries + 1)));
       return createBrowserContext(retries + 1);
     }
     throw error;
@@ -127,7 +163,9 @@ async function acceptCookiesEverywhere(page) {
     'button:has-text("Accept All")', 
     'button:has-text("I agree")',
     'button:has-text("Agree")',
-    '[data-e2e="cookie-banner-ok"]'
+    'button:has-text("Allow all")',
+    '[data-e2e="cookie-banner-ok"]',
+    '.cookie-banner button'
   ];
 
   for (const selector of cookieSelectors) {
@@ -136,6 +174,7 @@ async function acceptCookiesEverywhere(page) {
       if (await element.isVisible({ timeout: 1000 }).catch(() => false)) {
         await element.click({ delay: 100 });
         await page.waitForTimeout(500);
+        logger.debug("Accepted cookies");
         return true;
       }
     } catch (e) {
@@ -146,15 +185,40 @@ async function acceptCookiesEverywhere(page) {
 }
 
 async function smartScroll(page, options = {}) {
-  const { steps = 8, waitMs = 2000 } = options;
+  const { steps = 5, waitMs = 3000 } = options;
   
   for (let i = 0; i < steps; i++) {
-    await page.mouse.wheel(0, 800 + Math.random() * 400);
-    await page.waitForTimeout(waitMs + Math.random() * 500);
+    // Mobile-style scrolling
+    await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+    await page.waitForTimeout(waitMs + Math.random() * 1000);
   }
 }
 
-// Data extraction
+// Extract hashtags from text
+function extractHashtags(text = "") {
+  if (!text) return [];
+  const matches = text.match(/#[\p{L}\p{N}_]+/gu) || [];
+  return [...new Set(matches)].slice(0, 10);
+}
+
+// Extract views from text
+function extractViews(text) {
+  const matches = text.match(/(\d+(?:\.\d+)?)\s*([KMB]?)\s*views?/i);
+  if (!matches) return 0;
+  
+  const [, number, unit] = matches;
+  let views = parseFloat(number);
+  
+  switch (unit?.toUpperCase()) {
+    case 'K': views *= 1000; break;
+    case 'M': views *= 1000000; break;
+    case 'B': views *= 1000000000; break;
+  }
+  
+  return Math.floor(views);
+}
+
+// Data extraction from JSON
 async function extractTikTokData(page) {
   return await page.evaluate(() => {
     let state = null;
@@ -178,7 +242,8 @@ async function extractTikTokData(page) {
         const patterns = [
           /window\.__INITIAL_STATE__\s*=\s*({.+?});/s,
           /SIGI_STATE\s*=\s*({.+?});/s,
-          /"ItemModule":\s*({.+?})/s
+          /"ItemModule":\s*({.+?})/s,
+          /"itemModule":\s*({.+?})/s
         ];
         
         for (const pattern of patterns) {
@@ -203,6 +268,7 @@ async function extractTikTokData(page) {
   });
 }
 
+// Extract from DOM fallback
 async function extractFromDOM(page) {
   return await page.evaluate(() => {
     const videos = [];
@@ -238,10 +304,71 @@ async function extractFromDOM(page) {
   });
 }
 
-function extractHashtags(text = "") {
-  if (!text) return [];
-  const matches = text.match(/#[\p{L}\p{N}_]+/gu) || [];
-  return [...new Set(matches)].slice(0, 10);
+// Extract from profile pages
+async function extractFromProfile(page) {
+  return await page.evaluate(() => {
+    const videos = [];
+    
+    // Selettori per video nei profili
+    const videoSelectors = [
+      'a[href*="/video/"]',
+      '[data-e2e="user-post-item"] a',
+      '.video-feed-item a',
+      '[class*="video"] a[href*="/video/"]',
+      '[data-e2e="user-post-item-video"] a'
+    ];
+    
+    for (const selector of videoSelectors) {
+      const links = document.querySelectorAll(selector);
+      console.log(`Found ${links.length} links with selector: ${selector}`);
+      
+      for (const link of links) {
+        try {
+          const href = link.href;
+          if (!href || !href.includes('/video/')) continue;
+          
+          const match = href.match(/\/@([^/]+)\/video\/(\d+)/);
+          if (!match) continue;
+          
+          const [, username, videoId] = match;
+          
+          // Try to extract additional info from parent elements
+          const container = link.closest('[data-e2e="user-post-item"]') || 
+                           link.closest('.video-item') || 
+                           link.closest('[class*="item"]') || 
+                           link.parentElement;
+          
+          const img = container?.querySelector('img');
+          const textContent = container?.textContent || '';
+          
+          // Extract views from text if available
+          const views = extractViews(textContent);
+          
+          videos.push({
+            video_id: videoId,
+            video_url: href,
+            author_username: username,
+            caption: img?.alt || '',
+            hashtags: extractHashtags(img?.alt || ''),
+            thumbnail_url: img?.src || '',
+            views: views,
+            likes: 0,
+            comments: 0,
+            shares: 0,
+            published_at: new Date().toISOString(),
+            source: 'profile_extraction'
+          });
+          
+        } catch (e) {
+          continue;
+        }
+      }
+      
+      if (videos.length > 0) break;
+    }
+    
+    return videos;
+  });
 }
 
 function mapVideoData(state) {
@@ -274,7 +401,8 @@ function mapVideoData(state) {
         thumbnail_url: item.video?.cover || null,
         engagement_rate: item.stats?.playCount ? 
           ((item.stats.diggCount + item.stats.commentCount + item.stats.shareCount) / 
-           Math.max(item.stats.playCount, 1) * 100).toFixed(2) : 0
+           Math.max(item.stats.playCount, 1) * 100).toFixed(2) : 0,
+        source: 'JSON_extraction'
       };
     } catch (e) {
       return null;
@@ -282,41 +410,101 @@ function mapVideoData(state) {
   }).filter(Boolean);
 }
 
+// Main scraping function
 async function getExploreVideos(page, minVideos = 50) {
-  await page.goto(CONFIG.BASE_EXPLORE, { 
-    waitUntil: "domcontentloaded", 
-    timeout: CONFIG.REQUEST_TIMEOUT 
-  });
+  const allVideos = [];
   
-  await acceptCookiesEverywhere(page);
-  await page.waitForTimeout(3000);
-  
-  // Try JSON extraction
-  let state = await extractTikTokData(page);
-  let videos = mapVideoData(state);
-  
-  // Fallback to DOM extraction
-  if (videos.length === 0) {
-    videos = await extractFromDOM(page);
-  }
-  
-  // Try scrolling if not enough videos
-  if (videos.length < 10) {
-    await smartScroll(page);
-    state = await extractTikTokData(page);
-    const scrollVideos = mapVideoData(state);
-    
-    if (scrollVideos.length > videos.length) {
-      videos = scrollVideos;
-    } else {
-      const domVideos = await extractFromDOM(page);
-      if (domVideos.length > videos.length) {
-        videos = domVideos;
+  for (const url of TIKTOK_URLS) {
+    try {
+      logger.info(`🔍 Trying URL: ${url}`);
+      
+      await page.goto(url, { 
+        waitUntil: "networkidle", 
+        timeout: CONFIG.REQUEST_TIMEOUT 
+      });
+      
+      // Wait longer for mobile content
+      await page.waitForTimeout(8000);
+      
+      await acceptCookiesEverywhere(page);
+      await page.waitForTimeout(2000);
+      
+      // Check for blocks/challenges
+      const title = await page.title();
+      const urlCheck = page.url();
+      
+      if (title.includes('verify') || title.includes('challenge') || 
+          urlCheck.includes('challenge') || urlCheck.includes('captcha')) {
+        logger.warn(`❌ Challenge detected on ${url}`);
+        continue;
       }
+      
+      let videos = [];
+      
+      // Strategy 1: Profile extraction (for profile URLs)
+      if (url.includes('/@')) {
+        videos = await extractFromProfile(page);
+        logger.info(`📱 Profile extraction: ${videos.length} videos`);
+      }
+      
+      // Strategy 2: Standard JSON extraction
+      if (videos.length === 0) {
+        const state = await extractTikTokData(page);
+        videos = mapVideoData(state);
+        logger.info(`📄 JSON extraction: ${videos.length} videos`);
+      }
+      
+      // Strategy 3: DOM extraction
+      if (videos.length === 0) {
+        videos = await extractFromDOM(page);
+        logger.info(`🌐 DOM extraction: ${videos.length} videos`);
+      }
+      
+      // Strategy 4: Scroll and retry
+      if (videos.length < 5) {
+        logger.info(`🔄 Scrolling for more content...`);
+        
+        // Mobile-style scrolling
+        for (let i = 0; i < 3; i++) {
+          await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+          await page.waitForTimeout(3000);
+        }
+        
+        // Try extraction again after scroll
+        if (url.includes('/@')) {
+          const scrollVideos = await extractFromProfile(page);
+          if (scrollVideos.length > videos.length) videos = scrollVideos;
+        } else {
+          const state = await extractTikTokData(page);
+          const scrollVideos = mapVideoData(state);
+          if (scrollVideos.length > videos.length) videos = scrollVideos;
+        }
+      }
+      
+      if (videos.length > 0) {
+        allVideos.push(...videos);
+        logger.info(`✅ Success with ${url}: ${videos.length} videos`);
+        
+        // If we have enough videos, stop
+        if (allVideos.length >= 20) break;
+      }
+      
+      // Small delay between URLs
+      await page.waitForTimeout(2000);
+      
+    } catch (error) {
+      logger.warn(`❌ Error with ${url}:`, error.message);
+      continue;
     }
   }
   
-  return videos;
+  // Remove duplicates by video_id
+  const uniqueVideos = allVideos.filter((video, index, self) => 
+    index === self.findIndex(v => v.video_id === video.video_id)
+  );
+  
+  logger.info(`🎯 Total unique videos found: ${uniqueVideos.length}`);
+  return uniqueVideos;
 }
 
 async function scrapeTopTrending(limit = CONFIG.LIMIT_DEFAULT) {
@@ -324,8 +512,11 @@ async function scrapeTopTrending(limit = CONFIG.LIMIT_DEFAULT) {
   const cached = cache.get(cacheKey);
   
   if (cached) {
+    logger.info("Returning cached results");
     return cached;
   }
+  
+  logger.info(`Starting scrape for top ${limit} trending videos`);
   
   let browser, context;
   try {
@@ -334,16 +525,29 @@ async function scrapeTopTrending(limit = CONFIG.LIMIT_DEFAULT) {
     
     const videos = await getExploreVideos(page, limit);
     
+    // Sort by engagement if we have stats
+    const sortedVideos = videos
+      .filter(video => video && video.video_url && video.video_id)
+      .sort((a, b) => {
+        const engagementA = a.likes + a.comments + a.shares + (a.views || 0) / 100;
+        const engagementB = b.likes + b.comments + b.shares + (b.views || 0) / 100;
+        return engagementB - engagementA;
+      })
+      .slice(0, limit);
+    
     const result = {
-      videos: videos.slice(0, limit),
+      videos: sortedVideos,
       metadata: {
         scraped_at: new Date().toISOString(),
         total_found: videos.length,
-        returned: Math.min(videos.length, limit)
+        returned: sortedVideos.length,
+        sources_used: [...new Set(videos.map(v => v.source))]
       }
     };
     
     cache.set(cacheKey, result);
+    logger.info(`Scraping completed. Found ${sortedVideos.length} videos`);
+    
     return result;
     
   } catch (error) {
@@ -355,12 +559,19 @@ async function scrapeTopTrending(limit = CONFIG.LIMIT_DEFAULT) {
   }
 }
 
-// Routes
+// API Routes
 app.get("/", (_req, res) => {
   res.json({ 
     ok: true, 
     service: "TikTok Trending Scraper",
-    routes: ["/health", "/debug", "/trending"]
+    version: "3.0.0",
+    routes: [
+      "GET /health - Health check",
+      "GET /debug - Debug info", 
+      "GET /trending - Get trending videos",
+      "GET /test - Test extraction",
+      "GET /stats - Cache statistics"
+    ]
   });
 });
 
@@ -368,20 +579,27 @@ app.get("/health", (_req, res) => {
   res.json({ 
     ok: true, 
     timestamp: new Date().toISOString(),
-    cache_size: cache.size()
+    cache_size: cache.size(),
+    uptime: process.uptime()
   });
 });
 
 app.get("/trending", async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit ?? CONFIG.LIMIT_DEFAULT, 10) || CONFIG.LIMIT_DEFAULT, 100);
+    const limit = Math.min(
+      parseInt(req.query.limit ?? CONFIG.LIMIT_DEFAULT, 10) || CONFIG.LIMIT_DEFAULT, 
+      100
+    );
+    
     const result = await scrapeTopTrending(limit);
     res.json(result);
+    
   } catch (error) {
     logger.error("API Error:", error.message);
     res.status(500).json({ 
       error: "scraping_failed", 
-      message: error.message
+      message: error.message,
+      timestamp: new Date().toISOString()
     });
   }
 });
@@ -398,292 +616,77 @@ app.get("/debug", async (req, res) => {
       browser_launched: true,
       page_loaded: false,
       has_data: false,
-      video_links: 0
+      video_links: 0,
+      user_agent: CONFIG.USER_AGENT,
+      viewport: CONFIG.VIEWPORT
     };
     
-    await page.goto(CONFIG.BASE_EXPLORE, { waitUntil: "domcontentloaded", timeout: CONFIG.REQUEST_TIMEOUT });
-    info.page_loaded = true;
-    info.page_title = await page.title();
-    
-    await acceptCookiesEverywhere(page);
-    await page.waitForTimeout(2000);
-    
-    const state = await extractTikTokData(page);
-    info.has_data = Boolean(state?.ItemModule || state?.itemModule);
-    
-    const videoLinks = await page.locator('a[href*="/video/"]').count();
-    info.video_links = videoLinks;
+    try {
+      await page.goto(CONFIG.BASE_EXPLORE, { 
+        waitUntil: "domcontentloaded", 
+        timeout: CONFIG.REQUEST_TIMEOUT 
+      });
+      info.page_loaded = true;
+      info.page_title = await page.title();
+      info.final_url = page.url();
+      
+      await acceptCookiesEverywhere(page);
+      await page.waitForTimeout(3000);
+      
+      const state = await extractTikTokData(page);
+      info.has_data = Boolean(state?.ItemModule || state?.itemModule);
+      
+      const videoLinks = await page.locator('a[href*="/video/"]').count();
+      info.video_links = videoLinks;
+      
+      // Try profile extraction
+      const profileVideos = await extractFromProfile(page);
+      info.profile_videos = profileVideos.length;
+      info.sample_video = profileVideos[0] || null;
+      
+    } catch (e) {
+      info.error = e.message;
+    }
     
     res.json(info);
+    
   } catch (error) {
-    res.status(500).json({ error: "debug_failed", message: error.message });
+    res.status(500).json({ 
+      error: "debug_failed", 
+      message: error.message 
+    });
   } finally {
     if (context) await context.close().catch(() => {});
     if (browser) await browser.close().catch(() => {});
   }
 });
 
-// Legacy endpoint
-app.get("/top50", async (req, res) => {
-  req.url = "/trending";
-  app._router.handle(req, res);
-});
-
-// Error handling
-app.use((error, req, res, next) => {
-  logger.error("Unhandled error:", error);
-  res.status(500).json({ error: "internal_server_error" });
-});
-
-app.use((req, res) => {
-  res.status(404).json({ error: "not_found" });
-});
-
-// Start server
-const server = app.listen(CONFIG.PORT, () => {
-  logger.info(`🚀 TikTok Scraper running on port ${CONFIG.PORT}`);
-});
-
-server.on('error', (error) => {
-  logger.error('Server error:', error);
-  process.exit(1);
-});
-
-export default app;
-// AGGIUNGI queste funzioni al server.js esistente
-
-// Intercetta le chiamate API di TikTok
-async function interceptTikTokAPI(page) {
-  const apiResponses = [];
-  
-  // Intercetta tutte le chiamate di rete
-  page.on('response', async (response) => {
-    const url = response.url();
-    
-    // TikTok API endpoints che contengono video data
-    const apiPatterns = [
-      '/api/recommend/item_list/',
-      '/api/post/item_list/',
-      '/node/share/discover',
-      '/share/item/list',
-      '/web/discover/item_list',
-      '/api/challenge/item_list/',
-      '/aweme/v1/feed/'
-    ];
-    
-    const isRelevantAPI = apiPatterns.some(pattern => url.includes(pattern));
-    
-    if (isRelevantAPI && response.status() === 200) {
-      try {
-        const contentType = response.headers()['content-type'] || '';
-        if (contentType.includes('application/json')) {
-          const data = await response.json();
-          console.log(`📡 Intercepted API: ${url}`);
-          apiResponses.push({
-            url,
-            data,
-            timestamp: Date.now()
-          });
-        }
-      } catch (e) {
-        console.log(`❌ Failed to parse response from ${url}:`, e.message);
-      }
-    }
-  });
-  
-  return apiResponses;
-}
-
-// Estrai video data dalle risposte API intercettate
-function extractFromAPIResponses(apiResponses) {
-  const videos = [];
-  
-  for (const response of apiResponses) {
-    try {
-      const { data } = response;
-      
-      // Diversi path dove TikTok può mettere i video
-      const videoPaths = [
-        data.itemList,
-        data.item_list,
-        data.aweme_list,
-        data.data,
-        data.items,
-        data.list,
-        data.feed,
-        data.recommend_list
-      ];
-      
-      for (const path of videoPaths) {
-        if (Array.isArray(path) && path.length > 0) {
-          console.log(`✅ Found ${path.length} videos in API response`);
-          
-          for (const item of path) {
-            try {
-              const video = mapAPIVideoData(item);
-              if (video) videos.push(video);
-            } catch (e) {
-              continue;
-            }
-          }
-          break; // Stop at first successful path
-        }
-      }
-    } catch (e) {
-      continue;
-    }
-  }
-  
-  return videos;
-}
-
-// Mappa i dati video dalle API responses
-function mapAPIVideoData(item) {
-  try {
-    // TikTok API ha strutture diverse
-    const videoInfo = item.video || item.video_info || {};
-    const authorInfo = item.author || item.author_info || {};
-    const statsInfo = item.statistics || item.stats || {};
-    const musicInfo = item.music || item.music_info || {};
-    
-    return {
-      video_id: item.aweme_id || item.item_id || item.id || '',
-      video_url: item.share_url || `https://www.tiktok.com/@${authorInfo.unique_id}/video/${item.aweme_id || item.id}`,
-      author_username: authorInfo.unique_id || authorInfo.nickname || '',
-      author_display_name: authorInfo.nickname || authorInfo.unique_id || '',
-      caption: item.desc || item.description || '',
-      hashtags: extractHashtags(item.desc || item.description || ''),
-      sound_title: musicInfo.title || '',
-      sound_artist: musicInfo.author || musicInfo.artist || '',
-      views: statsInfo.play_count || statsInfo.view_count || 0,
-      likes: statsInfo.digg_count || statsInfo.like_count || 0,
-      comments: statsInfo.comment_count || 0,
-      shares: statsInfo.share_count || 0,
-      duration_sec: videoInfo.duration || 0,
-      published_at: item.create_time ? new Date(item.create_time * 1000).toISOString() : null,
-      thumbnail_url: videoInfo.cover?.url_list?.[0] || videoInfo.origin_cover?.url_list?.[0] || null,
-      engagement_rate: statsInfo.play_count ? 
-        ((statsInfo.digg_count + statsInfo.comment_count + statsInfo.share_count) / 
-         Math.max(statsInfo.play_count, 1) * 100).toFixed(2) : 0,
-      source: 'API_intercept'
-    };
-  } catch (e) {
-    return null;
-  }
-}
-
-// SOSTITUISCI la funzione getExploreVideos con questa versione migliorata
-async function getExploreVideos(page, minVideos = 50) {
-  const urls = [
-    "https://www.tiktok.com/foryou?lang=en",
-    "https://www.tiktok.com/explore?lang=en", 
-    "https://www.tiktok.com/trending?lang=en"
-  ];
-  
-  for (const url of urls) {
-    try {
-      console.log(`🔍 Trying URL: ${url}`);
-      
-      // Setup API interception
-      const apiResponses = await interceptTikTokAPI(page);
-      
-      await page.goto(url, { 
-        waitUntil: "networkidle", 
-        timeout: CONFIG.REQUEST_TIMEOUT 
-      });
-      
-      await acceptCookiesEverywhere(page);
-      
-      // Wait for content to load and APIs to be called
-      await page.waitForTimeout(5000);
-      
-      // Check for verification page
-      const title = await page.title();
-      if (title.includes('verify') || title.includes('challenge')) {
-        console.log(`❌ Challenge page detected on ${url}`);
-        continue;
-      }
-      
-      // Strategy 1: API Intercept (most reliable)
-      let videos = extractFromAPIResponses(apiResponses);
-      console.log(`📡 API intercept found: ${videos.length} videos`);
-      
-      // Strategy 2: JSON extraction from page
-      if (videos.length === 0) {
-        const state = await extractTikTokData(page);
-        videos = mapVideoData(state);
-        console.log(`📄 JSON extraction found: ${videos.length} videos`);
-      }
-      
-      // Strategy 3: DOM extraction
-      if (videos.length === 0) {
-        videos = await extractFromDOM(page);
-        console.log(`🌐 DOM extraction found: ${videos.length} videos`);
-      }
-      
-      // Strategy 4: Scroll and try again
-      if (videos.length < 10) {
-        console.log(`🔄 Scrolling to load more content...`);
-        await smartScroll(page, { steps: 5, waitMs: 3000 });
-        
-        // Wait for new API calls after scroll
-        await page.waitForTimeout(3000);
-        
-        // Try API intercept again
-        const newVideos = extractFromAPIResponses(apiResponses);
-        if (newVideos.length > videos.length) {
-          videos = newVideos;
-        }
-      }
-      
-      if (videos.length >= 5) { // Lower threshold for testing
-        console.log(`✅ Success with ${url}: ${videos.length} videos`);
-        return videos;
-      }
-      
-    } catch (error) {
-      console.log(`❌ Error with ${url}:`, error.message);
-      continue;
-    }
-  }
-  
-  console.log(`❌ All URLs failed`);
-  return [];
-}
-
-// AGGIUNGI questo endpoint per testing delle API
-app.get("/test-api", async (req, res) => {
+app.get("/test", async (req, res) => {
   let browser, context;
   try {
     ({ browser, context } = await createBrowserContext());
     const page = await context.newPage();
     
-    // Setup API monitoring
-    const apiCalls = [];
-    page.on('response', async (response) => {
-      const url = response.url();
-      if (url.includes('tiktok') && url.includes('api')) {
-        apiCalls.push({
-          url,
-          status: response.status(),
-          headers: response.headers()
-        });
-      }
-    });
-    
-    await page.goto("https://www.tiktok.com/foryou?lang=en", { 
-      waitUntil: "networkidle", 
-      timeout: 30000 
-    });
-    
+    const testUrl = req.query.url || "https://www.tiktok.com/@tiktok";
+    await page.goto(testUrl, { waitUntil: "networkidle", timeout: 30000 });
     await page.waitForTimeout(5000);
     
-    res.json({
-      api_calls_detected: apiCalls.length,
-      api_calls: apiCalls.slice(0, 10), // First 10 for brevity
-      page_title: await page.title(),
-      page_url: page.url()
-    });
+    const info = {
+      url: testUrl,
+      title: await page.title(),
+      final_url: page.url(),
+      video_links: await page.locator('a[href*="/video/"]').count(),
+      has_challenge: page.url().includes('challenge'),
+      viewport: await page.viewportSize(),
+      user_agent: await page.evaluate(() => navigator.userAgent)
+    };
+    
+    // Try extraction
+    const videos = await extractFromProfile(page);
+    info.videos_found = videos.length;
+    info.sample_videos = videos.slice(0, 3);
+    
+    res.json(info);
     
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -692,3 +695,75 @@ app.get("/test-api", async (req, res) => {
     if (browser) await browser.close().catch(() => {});
   }
 });
+
+app.get("/stats", (req, res) => {
+  res.json({
+    cache: {
+      size: cache.size(),
+      ttl_minutes: CONFIG.CACHE_TTL_MS / 60000
+    },
+    config: {
+      headless: CONFIG.HEADLESS,
+      default_limit: CONFIG.LIMIT_DEFAULT,
+      user_agent: CONFIG.USER_AGENT.slice(0, 50) + "...",
+      viewport: CONFIG.VIEWPORT,
+      urls_to_try: TIKTOK_URLS.length
+    },
+    system: {
+      uptime: process.uptime(),
+      memory: process.memoryUsage(),
+      node_version: process.version
+    }
+  });
+});
+
+// Legacy endpoint compatibility
+app.get("/top50", async (req, res) => {
+  logger.warn("Using deprecated endpoint /top50, use /trending instead");
+  req.url = "/trending";
+  return app._router.handle(req, res);
+});
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  logger.error("Unhandled error:", error);
+  res.status(500).json({
+    error: "internal_server_error",
+    message: "An unexpected error occurred"
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    error: "not_found",
+    message: `Route ${req.method} ${req.path} not found`
+  });
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  logger.info('SIGTERM received, shutting down gracefully');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  logger.info('SIGINT received, shutting down gracefully'); 
+  process.exit(0);
+});
+
+// Start server
+const server = app.listen(CONFIG.PORT, () => {
+  logger.info(`🚀 TikTok Scraper v3.0 running on port ${CONFIG.PORT}`);
+  logger.info(`📱 Using mobile strategy with iPhone User-Agent`);
+  logger.info(`🔗 Health: http://localhost:${CONFIG.PORT}/health`);
+  logger.info(`🧪 Test: http://localhost:${CONFIG.PORT}/test`);
+  logger.info(`🎯 API: http://localhost:${CONFIG.PORT}/trending`);
+});
+
+server.on('error', (error) => {
+  logger.error('Server error:', error);
+  process.exit(1);
+});
+
+export default app;
