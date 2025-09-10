@@ -1,0 +1,33 @@
+
+# .env.example - Template per le variabili d'ambiente
+# Copia questo file come .env e configura i valori
+
+# Ambiente
+NODE_ENV=production
+
+# Scraper Settings
+HEADLESS=true
+LIMIT=50
+LOG_LEVEL=info
+CACHE_TTL_MINUTES=15
+
+# Render automaticamente imposta PORT
+# PORT=3000
+
+# Performance
+MAX_RETRIES=3
+BROWSER_TIMEOUT=45000
+RATE_LIMIT_MAX=10
+
+# TikTok Settings
+BASE_EXPLORE_URL=https://www.tiktok.com/explore?lang=en
+
+# Geolocation (default: New York)
+GEOLOCATION_LAT=40.7128
+GEOLOCATION_LON=-74.0060
+TIMEZONE=America/New_York
+LOCALE=en-US
+
+# Debug (solo per sviluppo)
+DEBUG_MODE=false
+SAVE_SCREENSHOTS=false
