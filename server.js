@@ -450,3 +450,245 @@ server.on('error', (error) => {
 });
 
 export default app;
+// AGGIUNGI queste funzioni al server.js esistente
+
+// Intercetta le chiamate API di TikTok
+async function interceptTikTokAPI(page) {
+  const apiResponses = [];
+  
+  // Intercetta tutte le chiamate di rete
+  page.on('response', async (response) => {
+    const url = response.url();
+    
+    // TikTok API endpoints che contengono video data
+    const apiPatterns = [
+      '/api/recommend/item_list/',
+      '/api/post/item_list/',
+      '/node/share/discover',
+      '/share/item/list',
+      '/web/discover/item_list',
+      '/api/challenge/item_list/',
+      '/aweme/v1/feed/'
+    ];
+    
+    const isRelevantAPI = apiPatterns.some(pattern => url.includes(pattern));
+    
+    if (isRelevantAPI && response.status() === 200) {
+      try {
+        const contentType = response.headers()['content-type'] || '';
+        if (contentType.includes('application/json')) {
+          const data = await response.json();
+          console.log(`📡 Intercepted API: ${url}`);
+          apiResponses.push({
+            url,
+            data,
+            timestamp: Date.now()
+          });
+        }
+      } catch (e) {
+        console.log(`❌ Failed to parse response from ${url}:`, e.message);
+      }
+    }
+  });
+  
+  return apiResponses;
+}
+
+// Estrai video data dalle risposte API intercettate
+function extractFromAPIResponses(apiResponses) {
+  const videos = [];
+  
+  for (const response of apiResponses) {
+    try {
+      const { data } = response;
+      
+      // Diversi path dove TikTok può mettere i video
+      const videoPaths = [
+        data.itemList,
+        data.item_list,
+        data.aweme_list,
+        data.data,
+        data.items,
+        data.list,
+        data.feed,
+        data.recommend_list
+      ];
+      
+      for (const path of videoPaths) {
+        if (Array.isArray(path) && path.length > 0) {
+          console.log(`✅ Found ${path.length} videos in API response`);
+          
+          for (const item of path) {
+            try {
+              const video = mapAPIVideoData(item);
+              if (video) videos.push(video);
+            } catch (e) {
+              continue;
+            }
+          }
+          break; // Stop at first successful path
+        }
+      }
+    } catch (e) {
+      continue;
+    }
+  }
+  
+  return videos;
+}
+
+// Mappa i dati video dalle API responses
+function mapAPIVideoData(item) {
+  try {
+    // TikTok API ha strutture diverse
+    const videoInfo = item.video || item.video_info || {};
+    const authorInfo = item.author || item.author_info || {};
+    const statsInfo = item.statistics || item.stats || {};
+    const musicInfo = item.music || item.music_info || {};
+    
+    return {
+      video_id: item.aweme_id || item.item_id || item.id || '',
+      video_url: item.share_url || `https://www.tiktok.com/@${authorInfo.unique_id}/video/${item.aweme_id || item.id}`,
+      author_username: authorInfo.unique_id || authorInfo.nickname || '',
+      author_display_name: authorInfo.nickname || authorInfo.unique_id || '',
+      caption: item.desc || item.description || '',
+      hashtags: extractHashtags(item.desc || item.description || ''),
+      sound_title: musicInfo.title || '',
+      sound_artist: musicInfo.author || musicInfo.artist || '',
+      views: statsInfo.play_count || statsInfo.view_count || 0,
+      likes: statsInfo.digg_count || statsInfo.like_count || 0,
+      comments: statsInfo.comment_count || 0,
+      shares: statsInfo.share_count || 0,
+      duration_sec: videoInfo.duration || 0,
+      published_at: item.create_time ? new Date(item.create_time * 1000).toISOString() : null,
+      thumbnail_url: videoInfo.cover?.url_list?.[0] || videoInfo.origin_cover?.url_list?.[0] || null,
+      engagement_rate: statsInfo.play_count ? 
+        ((statsInfo.digg_count + statsInfo.comment_count + statsInfo.share_count) / 
+         Math.max(statsInfo.play_count, 1) * 100).toFixed(2) : 0,
+      source: 'API_intercept'
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// SOSTITUISCI la funzione getExploreVideos con questa versione migliorata
+async function getExploreVideos(page, minVideos = 50) {
+  const urls = [
+    "https://www.tiktok.com/foryou?lang=en",
+    "https://www.tiktok.com/explore?lang=en", 
+    "https://www.tiktok.com/trending?lang=en"
+  ];
+  
+  for (const url of urls) {
+    try {
+      console.log(`🔍 Trying URL: ${url}`);
+      
+      // Setup API interception
+      const apiResponses = await interceptTikTokAPI(page);
+      
+      await page.goto(url, { 
+        waitUntil: "networkidle", 
+        timeout: CONFIG.REQUEST_TIMEOUT 
+      });
+      
+      await acceptCookiesEverywhere(page);
+      
+      // Wait for content to load and APIs to be called
+      await page.waitForTimeout(5000);
+      
+      // Check for verification page
+      const title = await page.title();
+      if (title.includes('verify') || title.includes('challenge')) {
+        console.log(`❌ Challenge page detected on ${url}`);
+        continue;
+      }
+      
+      // Strategy 1: API Intercept (most reliable)
+      let videos = extractFromAPIResponses(apiResponses);
+      console.log(`📡 API intercept found: ${videos.length} videos`);
+      
+      // Strategy 2: JSON extraction from page
+      if (videos.length === 0) {
+        const state = await extractTikTokData(page);
+        videos = mapVideoData(state);
+        console.log(`📄 JSON extraction found: ${videos.length} videos`);
+      }
+      
+      // Strategy 3: DOM extraction
+      if (videos.length === 0) {
+        videos = await extractFromDOM(page);
+        console.log(`🌐 DOM extraction found: ${videos.length} videos`);
+      }
+      
+      // Strategy 4: Scroll and try again
+      if (videos.length < 10) {
+        console.log(`🔄 Scrolling to load more content...`);
+        await smartScroll(page, { steps: 5, waitMs: 3000 });
+        
+        // Wait for new API calls after scroll
+        await page.waitForTimeout(3000);
+        
+        // Try API intercept again
+        const newVideos = extractFromAPIResponses(apiResponses);
+        if (newVideos.length > videos.length) {
+          videos = newVideos;
+        }
+      }
+      
+      if (videos.length >= 5) { // Lower threshold for testing
+        console.log(`✅ Success with ${url}: ${videos.length} videos`);
+        return videos;
+      }
+      
+    } catch (error) {
+      console.log(`❌ Error with ${url}:`, error.message);
+      continue;
+    }
+  }
+  
+  console.log(`❌ All URLs failed`);
+  return [];
+}
+
+// AGGIUNGI questo endpoint per testing delle API
+app.get("/test-api", async (req, res) => {
+  let browser, context;
+  try {
+    ({ browser, context } = await createBrowserContext());
+    const page = await context.newPage();
+    
+    // Setup API monitoring
+    const apiCalls = [];
+    page.on('response', async (response) => {
+      const url = response.url();
+      if (url.includes('tiktok') && url.includes('api')) {
+        apiCalls.push({
+          url,
+          status: response.status(),
+          headers: response.headers()
+        });
+      }
+    });
+    
+    await page.goto("https://www.tiktok.com/foryou?lang=en", { 
+      waitUntil: "networkidle", 
+      timeout: 30000 
+    });
+    
+    await page.waitForTimeout(5000);
+    
+    res.json({
+      api_calls_detected: apiCalls.length,
+      api_calls: apiCalls.slice(0, 10), // First 10 for brevity
+      page_title: await page.title(),
+      page_url: page.url()
+    });
+    
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  } finally {
+    if (context) await context.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
+  }
+});
