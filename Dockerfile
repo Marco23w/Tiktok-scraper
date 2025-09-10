@@ -9,8 +9,8 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY package*.json ./
-RUN npm ci --only=production && npm cache clean --force
+COPY package.json ./
+RUN npm install --production && npm cache clean --force
 
 COPY server.js ./
 
@@ -23,5 +23,4 @@ USER appuser
 EXPOSE 3000
 
 CMD ["node", "server.js"]
-
 
