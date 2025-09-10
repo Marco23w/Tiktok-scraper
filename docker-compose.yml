@@ -1,1 +1,151 @@
+# docker-compose.yml
+version: '3.8'
 
+services:
+  tiktok-scraper:
+    build: .
+    container_name: tiktok-scraper
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - HEADLESS=${HEADLESS:-true}
+      - LIMIT=${LIMIT:-50}
+      - PORT=3000
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - CACHE_TTL_MINUTES=${CACHE_TTL_MINUTES:-15}
+    restart: unless-stopped
+    mem_limit: 1g
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - tiktok-network
+
+  # Redis per cache distribuita (opzionale ma raccomandato)
+  redis:
+    image: redis:7-alpine
+    container_name: tiktok-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    networks:
+      - tiktok-network
+
+  # Nginx reverse proxy (opzionale per produzione)
+  nginx:
+    image: nginx:alpine
+    container_name: tiktok-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./logs/nginx:/var/log/nginx
+    depends_on:
+      - tiktok-scraper
+    restart: unless-stopped
+    networks:
+      - tiktok-network
+    profiles:
+      - production
+
+volumes:
+  redis_data:
+    driver: local
+  logs:
+    driver: local
+
+networks:
+  tiktok-network:
+    driver: bridge
+
+---
+
+# .env file
+# ===========================================
+# TikTok Scraper Configuration
+# ===========================================
+
+# Environment
+NODE_ENV=production
+
+# Scraper Settings
+HEADLESS=true
+LIMIT=50
+LOG_LEVEL=info
+CACHE_TTL_MINUTES=15
+
+# Server Settings  
+PORT=3000
+
+# Redis Settings (se usi Redis)
+REDIS_URL=redis://redis:6379
+REDIS_TTL=900
+
+# Browser Settings
+BROWSER_TIMEOUT=45000
+MAX_RETRIES=3
+
+# Performance Settings
+MAX_CONCURRENT_REQUESTS=3
+RATE_LIMIT_WINDOW=60000
+RATE_LIMIT_MAX=10
+
+# Monitoring (opzionale)
+ENABLE_METRICS=false
+METRICS_PORT=9090
+
+# Logging
+LOG_ROTATION=true
+LOG_MAX_SIZE=10m
+LOG_MAX_FILES=5
+
+# Security (per produzione)
+CORS_ORIGIN=*
+HELMET_ENABLED=true
+
+# N8N Integration (se N8N è nello stesso network)
+N8N_WEBHOOK_URL=http://n8n:5678/webhook/tiktok-analysis
+
+# Database (opzionale per persistenza)
+# DATABASE_URL=postgresql://user:pass@postgres:5432/tiktok_data
+
+# Notifications (opzionale)
+# SLACK_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
+# DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/YOUR/DISCORD/WEBHOOK
+
+# External APIs (se necessario)
+# PROXY_URL=http://proxy:8080
+# USER_AGENT_OVERRIDE=Mozilla/5.0 (Custom User Agent)
+
+# Debug Settings
+DEBUG_MODE=false
+SAVE_SCREENSHOTS=false
+SAVE_HTML=false
+
+# Regional Settings
+TIMEZONE=Europe/Rome
+LOCALE=it-IT
+GEOLOCATION_LAT=41.9028
+GEOLOCATION_LON=12.4964
+
+# ===========================================
+# Development Settings (commenta in produzione)
+# ===========================================
+
+# Uncomment for development
+# NODE_ENV=development
+# LOG_LEVEL=debug
+# DEBUG_MODE=true
+# HEADLESS=false
