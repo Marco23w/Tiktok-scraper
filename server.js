@@ -1,73 +1,192 @@
-// SOSTITUZIONE COMPLETA della funzione extractTikTokData nel server.js
+// server.js - Versione completa e testata
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import compression from "compression";
+import { chromium as chromiumExtra } from "playwright-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
 
+chromiumExtra.use(StealthPlugin());
+
+const app = express();
+
+// Middleware
+app.use(helmet());
+app.use(cors());
+app.use(compression());
+app.use(express.json());
+
+// Configuration
+const CONFIG = {
+  HEADLESS: (process.env.HEADLESS ?? "true") !== "false",
+  LIMIT_DEFAULT: parseInt(process.env.LIMIT ?? "50", 10),
+  PORT: process.env.PORT || 3000,
+  LOG_LEVEL: process.env.LOG_LEVEL || "info",
+  CACHE_TTL_MS: parseInt(process.env.CACHE_TTL_MINUTES ?? "15", 10) * 60 * 1000,
+  BASE_EXPLORE: "https://www.tiktok.com/foryou?lang=en",
+  VIEWPORT: { width: 1920, height: 1080 },
+  MAX_RETRIES: 3,
+  REQUEST_TIMEOUT: 45000
+};
+
+// Simple logger
+const logger = {
+  info: (...args) => CONFIG.LOG_LEVEL !== "silent" && console.log(new Date().toISOString(), "[INFO]", ...args),
+  error: (...args) => console.error(new Date().toISOString(), "[ERROR]", ...args),
+  warn: (...args) => CONFIG.LOG_LEVEL === "debug" && console.warn(new Date().toISOString(), "[WARN]", ...args),
+  debug: (...args) => CONFIG.LOG_LEVEL === "debug" && console.log(new Date().toISOString(), "[DEBUG]", ...args)
+};
+
+// Simple cache
+class SimpleCache {
+  constructor(ttl = CONFIG.CACHE_TTL_MS) {
+    this.cache = new Map();
+    this.ttl = ttl;
+  }
+
+  set(key, value) {
+    const expires = Date.now() + this.ttl;
+    this.cache.set(key, { value, expires });
+  }
+
+  get(key) {
+    const item = this.cache.get(key);
+    if (!item) return null;
+    
+    if (Date.now() > item.expires) {
+      this.cache.delete(key);
+      return null;
+    }
+    
+    return item.value;
+  }
+
+  clear() {
+    this.cache.clear();
+  }
+
+  size() {
+    return this.cache.size;
+  }
+}
+
+const cache = new SimpleCache();
+
+// Browser utilities
+async function createBrowserContext(retries = 0) {
+  try {
+    const browser = await chromiumExtra.launch({
+      headless: CONFIG.HEADLESS,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-web-security",
+        "--disable-features=VizDisplayCompositor",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-blink-features=AutomationControlled",
+        "--no-first-run"
+      ],
+    });
+
+    const context = await browser.newContext({
+      viewport: CONFIG.VIEWPORT,
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+      locale: "en-US",
+      timezoneId: "America/New_York",
+      geolocation: { latitude: 40.7128, longitude: -74.0060 },
+      permissions: ["geolocation"],
+      hasTouch: false,
+      deviceScaleFactor: 1,
+      extraHTTPHeaders: {
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+      }
+    });
+
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+
+    return { browser, context };
+  } catch (error) {
+    logger.error("Failed to create browser context:", error.message);
+    if (retries < CONFIG.MAX_RETRIES) {
+      await new Promise(resolve => setTimeout(resolve, 2000 * (retries + 1)));
+      return createBrowserContext(retries + 1);
+    }
+    throw error;
+  }
+}
+
+async function acceptCookiesEverywhere(page) {
+  const cookieSelectors = [
+    'button:has-text("Accept all")',
+    'button:has-text("Accept All")', 
+    'button:has-text("I agree")',
+    'button:has-text("Agree")',
+    '[data-e2e="cookie-banner-ok"]'
+  ];
+
+  for (const selector of cookieSelectors) {
+    try {
+      const element = page.locator(selector).first();
+      if (await element.isVisible({ timeout: 1000 }).catch(() => false)) {
+        await element.click({ delay: 100 });
+        await page.waitForTimeout(500);
+        return true;
+      }
+    } catch (e) {
+      // Continue
+    }
+  }
+  return false;
+}
+
+async function smartScroll(page, options = {}) {
+  const { steps = 8, waitMs = 2000 } = options;
+  
+  for (let i = 0; i < steps; i++) {
+    await page.mouse.wheel(0, 800 + Math.random() * 400);
+    await page.waitForTimeout(waitMs + Math.random() * 500);
+  }
+}
+
+// Data extraction
 async function extractTikTokData(page) {
   return await page.evaluate(() => {
     let state = null;
     
-    // Strategy 1: Multiple window objects
-    const windowObjects = ['__INITIAL_STATE__', 'SIGI_STATE', '__NEXT_DATA__', '__APP_CONTEXT__'];
+    // Try window objects
+    const windowObjects = ['__INITIAL_STATE__', 'SIGI_STATE', '__NEXT_DATA__'];
     for (const obj of windowObjects) {
       if (window[obj]) {
-        console.log(`Found window.${obj}`);
         state = window[obj];
         break;
       }
     }
     
-    // Strategy 2: Script tags with different selectors
-    if (!state) {
-      const scriptSelectors = [
-        'script[id="__UNIVERSAL_DATA_FOR_REHYDRATION__"]',
-        'script[type="application/json"]',
-        'script[data-sentry-component="App"]',
-        'script:not([src]):not([type])'
-      ];
-      
-      for (const selector of scriptSelectors) {
-        const scripts = document.querySelectorAll(selector);
-        for (const script of scripts) {
-          try {
-            const text = script.textContent || script.innerText;
-            if (text.includes('ItemModule') || text.includes('itemModule') || text.includes('VideoModule')) {
-              console.log(`Found data in script with selector: ${selector}`);
-              state = JSON.parse(text);
-              break;
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-        if (state) break;
-      }
-    }
-    
-    // Strategy 3: All scripts search with multiple patterns
+    // Try script tags
     if (!state) {
       const scripts = Array.from(document.scripts);
-      const patterns = [
-        /window\.__INITIAL_STATE__\s*=\s*({.+?});/s,
-        /window\.SIGI_STATE\s*=\s*({.+?});/s,
-        /__INITIAL_STATE__["']?\s*[:=]\s*({.+?})[,;]/s,
-        /"props":\s*({.+?"pageProps".+?})/s,
-        /"ItemModule":\s*({.+?}),/s,
-        /"itemModule":\s*({.+?})/s
-      ];
-      
       for (const script of scripts) {
         const text = script.textContent || '';
-        if (text.length < 1000) continue; // Skip small scripts
+        if (text.length < 1000) continue;
+        
+        const patterns = [
+          /window\.__INITIAL_STATE__\s*=\s*({.+?});/s,
+          /SIGI_STATE\s*=\s*({.+?});/s,
+          /"ItemModule":\s*({.+?})/s
+        ];
         
         for (const pattern of patterns) {
           try {
             const match = text.match(pattern);
             if (match && match[1]) {
-              console.log('Found match with pattern:', pattern.source.slice(0, 50));
               const parsed = JSON.parse(match[1]);
-              
-              // Validate that it contains video data
-              if (parsed.ItemModule || parsed.itemModule || 
-                  (parsed.props && parsed.props.pageProps) ||
-                  parsed.videoModule || parsed.VideoModule) {
+              if (parsed.ItemModule || parsed.itemModule) {
                 state = parsed;
                 break;
               }
@@ -80,171 +199,119 @@ async function extractTikTokData(page) {
       }
     }
     
-    // Strategy 4: Look for any object with video-like data
-    if (!state) {
-      const scripts = Array.from(document.scripts);
-      for (const script of scripts) {
-        const text = script.textContent || '';
-        
-        // Look for common TikTok video properties
-        if (text.includes('"author"') && text.includes('"video"') && 
-            text.includes('"stats"') && text.includes('"playCount"')) {
-          
-          try {
-            // Try to extract the largest JSON object
-            const jsonMatches = text.match(/{[^{}]*"author"[^{}]*"video"[^{}]*}/g);
-            if (jsonMatches && jsonMatches.length > 0) {
-              const largestJson = jsonMatches.reduce((a, b) => a.length > b.length ? a : b);
-              console.log('Found video data in raw script');
-              
-              // Wrap in a structure similar to ItemModule
-              state = {
-                ItemModule: {
-                  'extracted_video': JSON.parse(largestJson)
-                }
-              };
-              break;
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-      }
-    }
-    
-    // Debug output
-    if (state) {
-      const keys = Object.keys(state);
-      console.log('Final state keys:', keys);
-      
-      // Count potential videos
-      let videoCount = 0;
-      if (state.ItemModule) videoCount = Object.keys(state.ItemModule).length;
-      else if (state.itemModule) videoCount = Object.keys(state.itemModule).length;
-      else if (state.props?.pageProps?.itemModule) videoCount = Object.keys(state.props.pageProps.itemModule).length;
-      
-      console.log('Potential video count:', videoCount);
-    } else {
-      console.log('No state found. Debugging page content...');
-      console.log('Page title:', document.title);
-      console.log('URL:', window.location.href);
-      console.log('Scripts count:', document.scripts.length);
-      
-      // Check if there are any obvious video containers
-      const videoContainers = document.querySelectorAll('[data-e2e="recommend-list-item"], .video-feed-item, [class*="video"], [class*="item"]');
-      console.log('Video-like containers found:', videoContainers.length);
-      
-      // Look for any data attributes
-      const dataElements = document.querySelectorAll('[data-*]');
-      console.log('Elements with data attributes:', dataElements.length);
-    }
-    
     return state;
   });
 }
 
-// NUOVA funzione per estrarre dati direttamente dal DOM se JSON fallisce
 async function extractFromDOM(page) {
   return await page.evaluate(() => {
     const videos = [];
+    const links = document.querySelectorAll('a[href*="/video/"]');
     
-    // Multiple selectors for video items
-    const selectors = [
-      '[data-e2e="recommend-list-item"]',
-      '.video-feed-item', 
-      '[class*="DivItemContainer"]',
-      '[class*="ItemContainer"]',
-      'a[href*="/video/"]'
-    ];
-    
-    for (const selector of selectors) {
-      const elements = document.querySelectorAll(selector);
-      console.log(`Found ${elements.length} elements with selector: ${selector}`);
-      
-      for (const el of elements) {
-        try {
-          // Extract video URL
-          const videoLink = el.querySelector('a[href*="/video/"]') || el;
-          const href = videoLink.href || videoLink.getAttribute('href');
-          
-          if (!href || !href.includes('/video/')) continue;
-          
-          // Extract basic info from DOM
-          const textContent = el.textContent || '';
-          const captionEl = el.querySelector('[data-e2e="video-desc"], .video-meta-caption, [class*="caption"]');
-          const authorEl = el.querySelector('[data-e2e="video-author"], .author-name, [class*="author"]');
-          
-          const video = {
-            video_id: href.match(/\/video\/(\d+)/)?.[1] || Date.now().toString(),
-            video_url: href,
-            author_username: authorEl?.textContent?.trim().replace('@', '') || 'unknown',
-            caption: captionEl?.textContent?.trim() || '',
-            hashtags: extractHashtags(captionEl?.textContent || ''),
-            views: 0,
-            likes: 0,
-            comments: 0,
-            shares: 0,
-            published_at: new Date().toISOString(),
-            source: 'DOM_extraction'
-          };
-          
-          videos.push(video);
-          
-        } catch (e) {
-          continue;
-        }
+    for (const link of links) {
+      try {
+        const href = link.href;
+        const match = href.match(/\/@([^/]+)\/video\/(\d+)/);
+        if (!match) continue;
+        
+        const [, username, videoId] = match;
+        
+        videos.push({
+          video_id: videoId,
+          video_url: href,
+          author_username: username,
+          caption: "",
+          hashtags: [],
+          views: 0,
+          likes: 0,
+          comments: 0,
+          shares: 0,
+          published_at: new Date().toISOString(),
+          source: 'DOM_extraction'
+        });
+      } catch (e) {
+        continue;
       }
-      
-      if (videos.length > 0) break; // Stop at first successful selector
     }
     
     return videos;
   });
 }
 
-// AGGIORNA la funzione getExploreVideos per usare entrambe le strategie
-async function getExploreVideos(page, minVideos = 60) {
-  logger.info("Starting explore page scraping...");
+function extractHashtags(text = "") {
+  if (!text) return [];
+  const matches = text.match(/#[\p{L}\p{N}_]+/gu) || [];
+  return [...new Set(matches)].slice(0, 10);
+}
+
+function mapVideoData(state) {
+  if (!state) return [];
   
+  let items = [];
+  if (state.ItemModule) {
+    items = Object.values(state.ItemModule);
+  } else if (state.itemModule) {
+    items = Object.values(state.itemModule);
+  }
+  
+  return items.map(item => {
+    try {
+      return {
+        video_id: item.id,
+        video_url: `https://www.tiktok.com/@${item.author}/video/${item.id}`,
+        author_username: item.author,
+        author_display_name: item.authorName || item.author,
+        caption: item.desc || "",
+        hashtags: extractHashtags(item.desc || ""),
+        sound_title: item.music?.title || "",
+        sound_artist: item.music?.authorName || "",
+        views: item.stats?.playCount || 0,
+        likes: item.stats?.diggCount || 0,
+        comments: item.stats?.commentCount || 0,
+        shares: item.stats?.shareCount || 0,
+        duration_sec: item.video?.duration || null,
+        published_at: item.createTime ? new Date(item.createTime * 1000).toISOString() : null,
+        thumbnail_url: item.video?.cover || null,
+        engagement_rate: item.stats?.playCount ? 
+          ((item.stats.diggCount + item.stats.commentCount + item.stats.shareCount) / 
+           Math.max(item.stats.playCount, 1) * 100).toFixed(2) : 0
+      };
+    } catch (e) {
+      return null;
+    }
+  }).filter(Boolean);
+}
+
+async function getExploreVideos(page, minVideos = 50) {
   await page.goto(CONFIG.BASE_EXPLORE, { 
     waitUntil: "domcontentloaded", 
     timeout: CONFIG.REQUEST_TIMEOUT 
   });
   
   await acceptCookiesEverywhere(page);
-  await page.waitForTimeout(3000); // Wait for dynamic content
+  await page.waitForTimeout(3000);
   
-  // Strategy 1: Try JSON extraction
+  // Try JSON extraction
   let state = await extractTikTokData(page);
   let videos = mapVideoData(state);
   
-  logger.info(`JSON extraction found ${videos.length} videos`);
-  
-  // Strategy 2: If JSON fails, try DOM extraction
+  // Fallback to DOM extraction
   if (videos.length === 0) {
-    logger.info("JSON extraction failed, trying DOM extraction...");
     videos = await extractFromDOM(page);
-    logger.info(`DOM extraction found ${videos.length} videos`);
   }
   
-  // Strategy 3: If still no videos, scroll and try again
-  if (videos.length < minVideos) {
-    logger.info("Scrolling to load more content...");
-    await smartScroll(page, { steps: 8, waitMs: 2000 });
-    
-    // Try JSON again after scroll
+  // Try scrolling if not enough videos
+  if (videos.length < 10) {
+    await smartScroll(page);
     state = await extractTikTokData(page);
     const scrollVideos = mapVideoData(state);
     
     if (scrollVideos.length > videos.length) {
       videos = scrollVideos;
-      logger.info(`After scroll JSON: ${videos.length} videos`);
     } else {
-      // Try DOM again after scroll
       const domVideos = await extractFromDOM(page);
       if (domVideos.length > videos.length) {
         videos = domVideos;
-        logger.info(`After scroll DOM: ${videos.length} videos`);
       }
     }
   }
@@ -252,55 +319,134 @@ async function getExploreVideos(page, minVideos = 60) {
   return videos;
 }
 
-// AGGIORNA mapVideoData per gestire strutture diverse
-function mapVideoData(state) {
-  if (!state) return [];
+async function scrapeTopTrending(limit = CONFIG.LIMIT_DEFAULT) {
+  const cacheKey = `trending_${limit}`;
+  const cached = cache.get(cacheKey);
   
-  let items = [];
-  
-  // Try different paths
-  if (state.ItemModule) {
-    items = Object.values(state.ItemModule);
-  } else if (state.itemModule) {
-    items = Object.values(state.itemModule);
-  } else if (state.props?.pageProps?.itemModule) {
-    items = Object.values(state.props.pageProps.itemModule);
-  } else if (state.props?.pageProps?.items) {
-    items = state.props.pageProps.items;
-  } else if (Array.isArray(state)) {
-    items = state;
+  if (cached) {
+    return cached;
   }
   
-  return items.map(item => {
-    try {
-      // Handle different item structures
-      const videoInfo = item.video || item;
-      const statsInfo = item.stats || {};
-      const authorInfo = item.author || item.authorName || 'unknown';
-      
-      return {
-        video_id: item.id || videoInfo.id || Date.now().toString(),
-        video_url: `https://www.tiktok.com/@${authorInfo}/video/${item.id || videoInfo.id}`,
-        author_username: authorInfo,
-        author_display_name: item.authorName || item.author || authorInfo,
-        caption: item.desc || item.caption || "",
-        hashtags: extractHashtags(item.desc || item.caption || ""),
-        sound_title: item.music?.title || "",
-        sound_artist: item.music?.authorName || item.music?.author || "",
-        views: statsInfo.playCount || 0,
-        likes: statsInfo.diggCount || 0,
-        comments: statsInfo.commentCount || 0,
-        shares: statsInfo.shareCount || 0,
-        duration_sec: videoInfo.duration || null,
-        published_at: item.createTime ? new Date(item.createTime * 1000).toISOString() : null,
-        thumbnail_url: videoInfo.cover || videoInfo.originCover || null,
-        engagement_rate: statsInfo.playCount ? 
-          ((statsInfo.diggCount + statsInfo.commentCount + statsInfo.shareCount) / 
-           Math.max(statsInfo.playCount, 1) * 100).toFixed(2) : 0
-      };
-    } catch (e) {
-      logger.warn("Error mapping video data:", e.message);
-      return null;
-    }
-  }).filter(Boolean);
+  let browser, context;
+  try {
+    ({ browser, context } = await createBrowserContext());
+    const page = await context.newPage();
+    
+    const videos = await getExploreVideos(page, limit);
+    
+    const result = {
+      videos: videos.slice(0, limit),
+      metadata: {
+        scraped_at: new Date().toISOString(),
+        total_found: videos.length,
+        returned: Math.min(videos.length, limit)
+      }
+    };
+    
+    cache.set(cacheKey, result);
+    return result;
+    
+  } catch (error) {
+    logger.error("Scraping failed:", error.message);
+    throw error;
+  } finally {
+    if (context) await context.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
+  }
 }
+
+// Routes
+app.get("/", (_req, res) => {
+  res.json({ 
+    ok: true, 
+    service: "TikTok Trending Scraper",
+    routes: ["/health", "/debug", "/trending"]
+  });
+});
+
+app.get("/health", (_req, res) => {
+  res.json({ 
+    ok: true, 
+    timestamp: new Date().toISOString(),
+    cache_size: cache.size()
+  });
+});
+
+app.get("/trending", async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit ?? CONFIG.LIMIT_DEFAULT, 10) || CONFIG.LIMIT_DEFAULT, 100);
+    const result = await scrapeTopTrending(limit);
+    res.json(result);
+  } catch (error) {
+    logger.error("API Error:", error.message);
+    res.status(500).json({ 
+      error: "scraping_failed", 
+      message: error.message
+    });
+  }
+});
+
+app.get("/debug", async (req, res) => {
+  let browser, context;
+  try {
+    ({ browser, context } = await createBrowserContext());
+    const page = await context.newPage();
+    
+    const info = {
+      url: CONFIG.BASE_EXPLORE,
+      timestamp: new Date().toISOString(),
+      browser_launched: true,
+      page_loaded: false,
+      has_data: false,
+      video_links: 0
+    };
+    
+    await page.goto(CONFIG.BASE_EXPLORE, { waitUntil: "domcontentloaded", timeout: CONFIG.REQUEST_TIMEOUT });
+    info.page_loaded = true;
+    info.page_title = await page.title();
+    
+    await acceptCookiesEverywhere(page);
+    await page.waitForTimeout(2000);
+    
+    const state = await extractTikTokData(page);
+    info.has_data = Boolean(state?.ItemModule || state?.itemModule);
+    
+    const videoLinks = await page.locator('a[href*="/video/"]').count();
+    info.video_links = videoLinks;
+    
+    res.json(info);
+  } catch (error) {
+    res.status(500).json({ error: "debug_failed", message: error.message });
+  } finally {
+    if (context) await context.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
+  }
+});
+
+// Legacy endpoint
+app.get("/top50", async (req, res) => {
+  req.url = "/trending";
+  app._router.handle(req, res);
+});
+
+// Error handling
+app.use((error, req, res, next) => {
+  logger.error("Unhandled error:", error);
+  res.status(500).json({ error: "internal_server_error" });
+});
+
+app.use((req, res) => {
+  res.status(404).json({ error: "not_found" });
+});
+
+// Start server
+const server = app.listen(CONFIG.PORT, () => {
+  logger.info(`🚀 TikTok Scraper running on port ${CONFIG.PORT}`);
+});
+
+server.on('error', (error) => {
+  logger.error('Server error:', error);
+  process.exit(1);
+});
+
+export default app;
